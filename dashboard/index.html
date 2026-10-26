@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>AGRIFLOW — Cloud Dashboard</title>
+<link rel="icon" href="data:,">
+<style>
+  :root{
+    --bg:#F2F5F1; --card:#FFFFFF; --border:#D8E2D9; --text:#12211A; --muted:#4A5D52;
+    --accent:#16A34A; --accent-dark:#15803D; --track:#DFE9E0; --segBg:#E7EEE8;
+    --warn:#B45309; --warn-bg:#FEF3C7; --bad:#DC2626; --bad-bg:#FDE8E8;
+    --ok-bg:#DCF5E5; --shadow:rgba(18,33,26,.08);
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+    font-size:15px;line-height:1.5}
+  header.topbar{position:sticky;top:0;z-index:10;background:#0F2E1D;color:#EDF5F0;
+    display:flex;justify-content:space-between;align-items:center;padding:12px 20px;min-height:56px}
+  .brand{font-size:18px;font-weight:800;letter-spacing:3px}
+  .brand small{display:block;font-size:11px;font-weight:600;letter-spacing:2px;color:#A7D7B5}
+  .topright{display:flex;align-items:center;gap:10px}
+  .pill{padding:5px 12px;border-radius:999px;font-size:11px;font-weight:700;letter-spacing:.09em;
+    background:#14532D;color:#4ADE80;border:1px solid #4ADE80}
+  .pill.off{background:transparent;color:#F87171;border-color:#F87171}
+  .pill.setup{background:transparent;color:#FBBF24;border-color:#FBBF24}
+  .upd{font-size:12px;color:#A7B8AE;font-variant-numeric:tabular-nums}
+  .wrap{max-width:960px;margin:0 auto;padding:20px 16px 40px}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:16px;
+    box-shadow:0 1px 3px var(--shadow);padding:18px;margin-bottom:14px}
+  .label{font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-bottom:10px}
+  .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
+  @media (max-width:760px){ .grid{grid-template-columns:repeat(2,1fr)} }
+  .stat .val{font-size:32px;font-weight:700;font-variant-numeric:tabular-nums;line-height:1.1}
+  .stat .val .unit{font-size:15px;color:var(--muted);font-weight:600}
+  .stat .sub{font-size:13px;color:var(--muted);margin-top:4px}
+  .stat .val.green{color:var(--accent-dark)}
+  .stat .val.amber{color:var(--warn)}
+  .hero{display:grid;grid-template-columns:300px 1fr;gap:18px;align-items:center}
+  @media (max-width:760px){ .hero{grid-template-columns:1fr} }
+  .gaugeBox{position:relative;max-width:300px;margin:0 auto}
+  svg.gauge{width:100%;height:auto;display:block}
+  #gaugeArc{transition:stroke-dashoffset .6s ease,stroke .4s ease}
+  .heroNum{position:absolute;left:0;right:0;top:33%;text-align:center;font-size:56px;font-weight:700;line-height:1;font-variant-numeric:tabular-nums}
+  .heroNum .sign{font-size:24px;color:var(--muted)}
+  .heroStatus{position:absolute;left:0;right:0;top:69%;text-align:center;font-size:13px;font-weight:700;letter-spacing:2px}
+  .rawline{text-align:center;color:var(--muted);font-size:13px;margin-top:8px;font-variant-numeric:tabular-nums}
+  .rawline b{color:var(--text)}
+  canvas#chart{width:100%;height:180px;display:block}
+  .chartMeta{display:flex;justify-content:space-between;font-size:12.5px;color:var(--muted);margin-top:8px}
+  .seg{display:flex;background:var(--segBg);border:1px solid var(--border);border-radius:999px;padding:4px;gap:4px}
+  .seg button{flex:1;height:48px;border:0;border-radius:999px;background:transparent;color:var(--muted);font-size:15px;font-weight:600;letter-spacing:1px;cursor:pointer}
+  .seg button.active{background:var(--accent);color:#fff}
+  .seg button:disabled{opacity:.45;cursor:not-allowed}
+  .motorRow{display:flex;gap:10px;margin-top:12px}
+  .motorRow button{flex:1;min-height:52px;border-radius:12px;font-size:15.5px;font-weight:700;cursor:pointer;border:1px solid var(--border);background:#fff;color:var(--text)}
+  .motorRow button.on{border-color:var(--accent);color:var(--accent-dark)}
+  .motorRow button.on.active{background:var(--accent);color:#fff;border-color:var(--accent)}
+  .motorRow button.off.active{background:#334155;color:#fff;border-color:#334155}
+  .motorRow button:disabled{opacity:.45;cursor:not-allowed}
+  .note{font-size:13px;color:var(--warn);margin-top:10px;line-height:1.5}
+  .note.info{color:var(--muted)}
+  .thresh{display:grid;grid-template-columns:1fr 1fr auto;gap:10px;align-items:end;margin-top:6px}
+  @media (max-width:520px){ .thresh{grid-template-columns:1fr 1fr} }
+  .thresh label{display:block;font-size:12px;font-weight:600;color:var(--muted);margin-bottom:5px}
+  .thresh input{width:100%;height:46px;border:1px solid var(--border);border-radius:10px;padding:0 12px;font-size:16px;font-family:inherit}
+  .thresh button{height:46px;padding:0 20px;border:0;border-radius:10px;background:var(--accent);color:#fff;font-size:15px;font-weight:700;cursor:pointer}
+  .thresh button:disabled{opacity:.5;cursor:not-allowed}
+  #toast{min-height:20px;text-align:center;color:var(--warn);font-size:14px;margin-top:10px}
+  #setupBanner{display:none;background:var(--warn-bg);border:1px solid var(--warn);color:#92400E;
+    border-radius:12px;padding:14px 16px;font-size:14.5px;line-height:1.55;margin-bottom:14px}
+  #setupBanner code{background:rgba(0,0,0,.06);padding:1px 6px;border-radius:6px}
+  footer{text-align:center;color:var(--muted);font-size:12.5px;line-height:1.7}
+  .dim{opacity:.55}
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">AGRIFLOW<small>SMART PLANT WATERING · CLOUD</small></div>
+  <div class="topright"><span class="pill setup" id="livePill">SETUP</span><span class="upd" id="updText">not configured</span></div>
+</header>
+
+<main class="wrap">
+  <div id="setupBanner">
+    <strong>Dashboard is not connected yet.</strong><br>
+    Fill in the Firebase values in <code>config.js</code> (from the Firebase console:
+    Project settings &rarr; Your apps &rarr; Web app), then redeploy.
+    Until then this page shows no live data.
+  </div>
+
+  <section class="card" id="heroCard">
+    <div class="label">Soil Moisture — Live from Firebase</div>
+    <div class="hero">
+      <div class="gaugeBox">
+        <svg class="gauge" viewBox="0 0 200 118" aria-hidden="true">
+          <path d="M 16 102 A 84 84 0 0 1 184 102" fill="none" stroke="var(--track)" stroke-width="16" stroke-linecap="round"/>
+          <path id="gaugeArc" d="M 16 102 A 84 84 0 0 1 184 102" fill="none" stroke="#4ADE80" stroke-width="16" stroke-linecap="round" stroke-dasharray="263.89" stroke-dashoffset="263.89"/>
+          <line id="dryTick" x1="41" y1="60" x2="29" y2="50" stroke="#4A5D52" stroke-width="2.5"/>
+        </svg>
+        <div class="heroNum"><span id="moistPct">--</span><span class="sign">%</span></div>
+        <div class="heroStatus" id="moistStatus">WAITING</div>
+      </div>
+      <div>
+        <div class="rawline" style="text-align:left;margin-top:0">Sensor raw <b id="rawVal">----</b> · wet 1050 · dry 3050</div>
+        <p class="note info" id="cloudNote" style="margin-top:12px">Waiting for the board to push its first reading…</p>
+        <p class="note info">Pump ON below <b id="footDry">30</b>% moisture · OFF above <b id="footWet">50</b>% (AUTO mode).</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="grid" id="statGrid">
+    <div class="card stat dim"><div class="label">Temperature</div><div class="val" id="tempVal">--</div><div class="sub">DHT11 sensor</div></div>
+    <div class="card stat dim"><div class="label">Humidity · Air</div><div class="val" id="humVal">--</div><div class="sub">DHT11 sensor</div></div>
+    <div class="card stat dim"><div class="label">Pump</div><div class="val" id="pumpVal">--</div><div class="sub" id="pumpSub">no data yet</div></div>
+    <div class="card stat dim"><div class="label">Mode</div><div class="val" id="modeVal">--</div><div class="sub" id="modeSub">no data yet</div></div>
+  </section>
+
+  <section class="card dim" id="chartCard">
+    <div class="label">Moisture History — Last 50 Samples · From Firebase</div>
+    <canvas id="chart" height="180"></canvas>
+    <div class="chartMeta"><span id="chartRange">no samples yet</span><span>dashed lines = pump ON / OFF thresholds</span></div>
+  </section>
+
+  <section class="card dim" id="controlsCard">
+    <div class="label">Controls — Sent to the board through Firebase</div>
+    <div class="seg" id="modeSeg">
+      <button id="segAuto" class="active">AUTO</button>
+      <button id="segManual">MANUAL</button>
+    </div>
+    <div class="motorRow">
+      <button id="motorOn" class="on">Pump ON</button>
+      <button id="motorOff" class="off active">Pump OFF</button>
+    </div>
+    <div class="note" id="pumpNote" style="display:none">Auto mode is driving the pump — switch to MANUAL to run it yourself.</div>
+    <div class="label" style="margin-top:16px">Auto thresholds</div>
+    <div class="thresh">
+      <div><label for="onBelow">Pump ON below (%)</label><input id="onBelow" type="number" min="0" max="99" value="30"></div>
+      <div><label for="offAbove">Pump OFF above (%)</label><input id="offAbove" type="number" min="1" max="100" value="50"></div>
+      <button id="applyThresh">Apply</button>
+    </div>
+    <div id="toast"></div>
+  </section>
+
+  <footer>
+    AGRIFLOW · ESP32 + Firebase Realtime Database · VIT-AP Engineering Clinics<br>
+    Readings update every 10 s from the board · History sample every 60 s
+  </footer>
+</main>
+
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
+<script src="./config.js"></script>
+<script src="./app.js"></script>
+</body>
+</html>
