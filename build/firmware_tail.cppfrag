@@ -1,0 +1,588 @@
+)AGRIFLOW";
+
+// ---------------------------------------------------------------------------
+// Forward declarations (explicit, so the sketch compiles even where the
+// Arduino IDE's automatic prototype generation is confused by the large
+// web-page string above — this was the V2.0 'beep not declared' error).
+// ---------------------------------------------------------------------------
+void setPump(bool on);
+void doSetMode(bool auto_);
+void doToggleMode();
+bool doPumpCommand(const String &state);
+bool doTogglePump();
+void beep(unsigned long durationMs);
+void buzzerService();
+void alertService();
+void getMoisture();
+void readDHT();
+void controlPumpAuto();
+void updateOLED();
+String buildJson(const char *err);
+void sendJson(const char *err);
+void handleRoot();
+void handleData();
+void handlePump();
+void handleMode();
+void handleToggle();
+void handleWater();
+void pumpGuardService();
+void button1Handler(AceButton *button, uint8_t eventType, uint8_t buttonState);
+void button2Handler(AceButton *button, uint8_t eventType, uint8_t buttonState);
+void showOledEvent(const char *label, const char *value);
+void drawOledEvent();
+// V3 cloud functions
+bool firebasePut(const String &path, const String &json);
+bool firebasePost(const String &path, const String &json);
+bool firebaseGet(const String &path, String &out);
+void applyControl(const String &payload);
+void cloudSyncService();
+void wifiLedService();
+
+// ---------------------------------------------------------------------------
+// OLED event flash (V2.3, Tim's request): when the mode changes or the motor
+// turns on/off, the OLED shows it full-screen for ~2 seconds, then the
+// normal screen returns. Triggered from setPump()/doSetMode(), so it fires
+// for web buttons, physical buttons AND auto-mode pump changes alike.
+// ---------------------------------------------------------------------------
+String oledEventLabel = "";
+String oledEventValue = "";
+unsigned long oledEventUntil = 0;
+bool oledEventActive = false;
+
+void drawOledEvent() {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(46, 1);
+    display.print(oledEventLabel);
+    display.setTextSize(2);
+    display.setCursor(28, 13);
+    display.print(oledEventValue);
+    display.display();
+}
+void showOledEvent(const char *label, const char *value) {
+    oledEventLabel = label;
+    oledEventValue = value;
+    oledEventUntil = millis() + 2000;
+    oledEventActive = true;
+    drawOledEvent();
+}
+
+// ---------------------------------------------------------------------------
+// Core state control — the ONLY places the pump/mode are allowed to change.
+// ---------------------------------------------------------------------------
+void setPump(bool on) {
+    if (on && !pumpOn && millis() < pumpCooldownUntil) return;  // failsafe rest
+    if (on == pumpOn) return;
+    pumpOn = on;
+    digitalWrite(RelayPin, on ? HIGH : LOW);
+    if (on) {
+        pumpStartedAt = millis();
+        pumpRuns++;
+    } else {
+        pumpTotalMs += millis() - pumpStartedAt;
+        lastRunSec = (millis() - pumpStartedAt) / 1000;
+        timedWaterUntil = 0;
+    }
+    showOledEvent("MOTOR", on ? "ON" : "OFF");
+    Serial.println(on ? "Pump: ON" : "Pump: OFF");
+}
+
+void doSetMode(bool auto_) {
+    if (autoMode == auto_) return;
+    autoMode = auto_;
+    digitalWrite(ModeLed, autoMode ? HIGH : LOW);
+    showOledEvent("MODE", auto_ ? "AUTO" : "MANUAL");
+    beep(120);
+    Serial.println(autoMode ? "Mode: AUTO" : "Mode: MANUAL");
+}
+
+void doToggleMode() { doSetMode(!autoMode); }
+
+// Returns false when AUTO mode refuses the command (caller reports the error).
+bool doPumpCommand(const String &state) {
+    if (autoMode) return false;
+    bool wantOn = (state == "on") || (state != "off" && !pumpOn);
+    if (wantOn && millis() < pumpCooldownUntil) return false;  // failsafe rest
+    timedWaterUntil = 0;  // any manual command cancels a timed run
+    setPump(wantOn);
+    beep(120);
+    return true;
+}
+
+bool doTogglePump() { return doPumpCommand("toggle"); }
+
+// ---------------------------------------------------------------------------
+// Buzzer — fully non-blocking. beep() just schedules; buzzerService() in
+// loop() switches it off. The web server never waits on a beep (V1 used
+// delay(500) inside its handlers and froze the whole server).
+// ---------------------------------------------------------------------------
+void beep(unsigned long durationMs) {
+    digitalWrite(BuzzerPin, HIGH);
+    buzzerOn = true;
+    buzzerOffAt = millis() + durationMs;
+}
+
+void buzzerService() {
+    if (buzzerOn && (long)(millis() - buzzerOffAt) >= 0) {
+        digitalWrite(BuzzerPin, LOW);
+        buzzerOn = false;
+    }
+}
+
+// V1 behaviour, kept: in MANUAL mode, beep repeatedly while the soil is too
+// dry with the pump off, or too wet with the pump on. Now non-blocking.
+void alertService() {
+    if (autoMode) return;
+    bool needsAlert = (moisturePercentage < moistPerLow && !pumpOn) ||
+                      (moisturePercentage > moistPerHigh && pumpOn);
+    if (needsAlert && (millis() - lastAlertMillis >= (unsigned long)buzzerInterval)) {
+        lastAlertMillis = millis();
+        beep(250);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sensors
+// ---------------------------------------------------------------------------
+void getMoisture() {
+    sensorVal = analogRead(SensorPin);
+    // Sensor-fault detection (V2.4, corrected in V2.6): ONLY a raw reading
+    // pinned at 0 is a fault — that means the sensor signal is shorted to
+    // ground. The top rail (4095) is NOT a fault: this probe sits at ~4095
+    // in open air, which is a genuine bone-dry reading (0%). V2.4 treated
+    // both rails as faults, so AUTO showed SENSOR FAULT whenever the probe
+    // was out of the soil. 3 samples in a row (6 s) trips the fault, stops
+    // the pump and blocks AUTO until readings look sane again.
+    if (sensorVal <= 0) {
+        if (++faultStreak >= 3 && !sensorFault) {
+            sensorFault = true;
+            if (pumpOn) setPump(false);
+            beep(250);
+            Serial.println("SENSOR FAULT: raw pinned at 0 (signal short)");
+        }
+    } else {
+        faultStreak = 0;
+        sensorFault = false;
+    }
+    moisturePercentage = map(sensorVal, drySoilVal, wetSoilVal, 0, 100);
+    moisturePercentage = constrain(moisturePercentage, 0, 100);
+}
+
+// On failure keep the last good values and flag it — never show a fake 0.
+void readDHT() {
+    float t = dht.readTemperature();
+    float h = dht.readHumidity();
+    if (isnan(t) || isnan(h)) {
+        dhtOk = false;
+        Serial.println("DHT read failed - keeping last good values");
+    } else {
+        temperatureC = t;
+        humidityPct = h;
+        dhtOk = true;
+    }
+}
+
+// AUTO logic (same thresholds as V1), through setPump() so state stays true.
+void controlPumpAuto() {
+    if (!autoMode || sensorFault) return;
+    if (moisturePercentage < moistPerLow && !pumpOn) setPump(true);
+    if (moisturePercentage > moistPerHigh && pumpOn) setPump(false);
+}
+
+// OLED layout identical to V1.
+void updateOLED() {
+    if (oledEventActive) return;  // event flash on screen — don't overwrite it
+    if (sensorFault) {
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setCursor(22, 2);
+        display.print("SENSOR FAULT");
+        display.setTextSize(2);
+        display.setCursor(10, 13);
+        display.print("CHECK PIN");
+        display.display();
+        return;
+    }
+    display.clearDisplay();
+    display.setTextSize(2);
+    display.setCursor(30, 2);
+    display.print(moisturePercentage); display.print(" %");
+    display.setTextSize(1);
+    display.setCursor(1, 25);
+    display.print("T:"); display.print((int)temperatureC); display.print(" C, ");
+    display.print("H:"); display.print((int)humidityPct); display.print("%  ");
+    display.print(autoMode ? "A:" : "M:");
+    display.print(pumpOn ? "1" : "0");
+    display.display();
+}
+
+// ---------------------------------------------------------------------------
+// JSON API — one builder, so every route returns exactly the same shape.
+// (V3 adds two fields: "online" = hotspot connected, "cloudOk" = the last
+// Firebase round-trip succeeded. The local page ignores fields it does not
+// read, so this is backwards compatible.)
+// ---------------------------------------------------------------------------
+String buildJson(const char *err) {
+    String j = "{";
+    j += "\"moisture\":" + String(moisturePercentage);
+    j += ",\"raw\":" + String(sensorVal);
+    j += ",\"temp\":" + String(temperatureC, 1);
+    j += ",\"hum\":" + String(humidityPct, 1);
+    j += ",\"pump\":" + String(pumpOn ? "true" : "false");
+    j += ",\"auto\":" + String(autoMode ? "true" : "false");
+    j += ",\"dhtOk\":" + String(dhtOk ? "true" : "false");
+    j += ",\"uptimeSec\":" + String(millis() / 1000);
+    j += ",\"dryBelow\":" + String(moistPerLow);
+    j += ",\"wetAbove\":" + String(moistPerHigh);
+    j += ",\"runs\":" + String(pumpRuns);
+    unsigned long totMs = pumpTotalMs + (pumpOn ? millis() - pumpStartedAt : 0);
+    j += ",\"pumpSec\":" + String(totMs / 1000);
+    j += ",\"lastSec\":" + String(lastRunSec);
+    j += ",\"fault\":" + String(sensorFault ? "true" : "false");
+    j += ",\"coolSec\":" + String(millis() < pumpCooldownUntil ? (pumpCooldownUntil - millis()) / 1000 : 0);
+    j += ",\"timedSec\":" + String(timedWaterUntil && millis() < timedWaterUntil ? (timedWaterUntil - millis()) / 1000 : 0);
+    j += ",\"online\":" + String(wifiOnline ? "true" : "false");
+    j += ",\"cloudOk\":" + String(cloudOk ? "true" : "false");
+    if (err) { j += ",\"err\":\""; j += err; j += "\""; }
+    j += "}";
+    return j;
+}
+
+void sendJson(const char *err) {
+    server.send(200, "application/json", buildJson(err));
+}
+
+// ---------------------------------------------------------------------------
+// HTTP handlers (server.send() happens ONLY inside these functions)
+// ---------------------------------------------------------------------------
+void handleRoot() {
+    server.send_P(200, "text/html", PAGE_HTML);
+}
+
+void handleData() {
+    sendJson(nullptr);
+}
+
+void handlePump() {
+    if (doPumpCommand(server.arg("state"))) sendJson(nullptr);
+    else if (autoMode) sendJson("auto-controls-pump");
+    else sendJson("failsafe-rest");
+}
+
+// Timed watering (V2.4): /water?sec=10 — MANUAL mode only, clamped 5–60 s.
+// The pump starts now and pumpGuardService() stops it when time is up.
+void handleWater() {
+    if (autoMode) { sendJson("auto-controls-pump"); return; }
+    if (millis() < pumpCooldownUntil) { sendJson("failsafe-rest"); return; }
+    int sec = server.arg("sec").toInt();
+    if (sec < 5) sec = 5;
+    if (sec > 60) sec = 60;
+    timedWaterUntil = millis() + (unsigned long)sec * 1000UL;
+    setPump(true);
+    beep(120);
+    sendJson(nullptr);
+}
+
+void handleMode() {
+    String s = server.arg("state");
+    if (s == "auto") doSetMode(true);
+    else if (s == "manual") doSetMode(false);
+    else doToggleMode();  // no/unknown state = toggle (legacy behaviour)
+    sendJson(nullptr);
+}
+
+// Legacy V1 routes — kept so any old bookmark/app still works, now on the
+// new logic and returning JSON.
+void handleToggle() {
+    if (doTogglePump()) sendJson(nullptr);
+    else sendJson("auto-controls-pump");
+}
+
+// ---------------------------------------------------------------------------
+// V3 — Firebase Realtime Database over HTTPS REST.
+// One shared secure client + HTTPClient with connection reuse, so the TLS
+// handshake happens once and later calls reuse the session. Every call has
+// a 3 s timeout; a failed call just marks cloudOk=false and the board
+// retries on the next cycle — the local pump logic never depends on the
+// cloud. setInsecure() skips certificate checks (standard for hobby
+// projects; the data here is garden sensor readings, not secrets).
+// ---------------------------------------------------------------------------
+WiFiClientSecure fbClient;
+HTTPClient fbHttp;
+
+bool firebasePut(const String &path, const String &json) {
+    if (WiFi.status() != WL_CONNECTED) return false;
+    String url = String("https://") + FIREBASE_HOST + path + ".json";
+    fbClient.setInsecure();
+    fbHttp.setReuse(true);
+    fbHttp.setTimeout(3000);
+    if (!fbHttp.begin(fbClient, url)) return false;
+    fbHttp.addHeader("Content-Type", "application/json");
+    int code = fbHttp.PUT(json);
+    fbHttp.end();
+    return code == 200;
+}
+
+bool firebasePost(const String &path, const String &json) {
+    if (WiFi.status() != WL_CONNECTED) return false;
+    String url = String("https://") + FIREBASE_HOST + path + ".json";
+    fbClient.setInsecure();
+    fbHttp.setReuse(true);
+    fbHttp.setTimeout(3000);
+    if (!fbHttp.begin(fbClient, url)) return false;
+    fbHttp.addHeader("Content-Type", "application/json");
+    int code = fbHttp.POST(json);
+    fbHttp.end();
+    return code == 200;
+}
+
+bool firebaseGet(const String &path, String &out) {
+    if (WiFi.status() != WL_CONNECTED) return false;
+    String url = String("https://") + FIREBASE_HOST + path + ".json";
+    fbClient.setInsecure();
+    fbHttp.setReuse(true);
+    fbHttp.setTimeout(3000);
+    if (!fbHttp.begin(fbClient, url)) return false;
+    int code = fbHttp.GET();
+    if (code == 200) out = fbHttp.getString();
+    fbHttp.end();
+    return code == 200;
+}
+
+// Apply one /agriflow/control document from the cloud dashboard.
+// {"pump":"on"|"off", "mode":"auto"|"manual",
+//  "onThreshold":30, "offThreshold":50}
+// Missing keys are ignored; "null" (empty node) is ignored. Pump commands
+// only apply in MANUAL mode — in AUTO the board's own logic owns the pump,
+// exactly like the local /pump route.
+void applyControl(const String &payload) {
+    if (payload.length() == 0 || payload == "null") return;
+    StaticJsonDocument<256> doc;
+    if (deserializeJson(doc, payload)) {
+        Serial.println("Control: bad JSON, ignored");
+        return;
+    }
+    if (doc.containsKey("onThreshold") && doc.containsKey("offThreshold")) {
+        int lo = doc["onThreshold"];
+        int hi = doc["offThreshold"];
+        if (lo >= 0 && hi <= 100 && lo < hi) {
+            moistPerLow = lo;
+            moistPerHigh = hi;
+            Serial.print("Control: thresholds now ");
+            Serial.print(lo); Serial.print("/"); Serial.println(hi);
+        }
+    }
+    if (doc.containsKey("mode")) {
+        const char *m = doc["mode"];
+        if (m && strcmp(m, "auto") == 0) doSetMode(true);
+        else if (m && strcmp(m, "manual") == 0) doSetMode(false);
+    }
+    if (doc.containsKey("pump")) {
+        const char *p = doc["pump"];
+        if (p && !autoMode) {
+            if (strcmp(p, "on") == 0 && !pumpOn) doPumpCommand("on");
+            else if (strcmp(p, "off") == 0 && pumpOn) doPumpCommand("off");
+        }
+    }
+}
+
+// Cloud sync — called every loop pass, does work only when a timer is due.
+// Live push 10 s, control poll 3 s, history sample 60 s.
+void cloudSyncService() {
+    if (!wifiOnline) return;
+    if (WiFi.status() != WL_CONNECTED) {
+        wifiOnline = false;  // hotspot dropped — AP keeps working locally
+        Serial.println("Hotspot lost — AP-only mode");
+        return;
+    }
+    unsigned long now = millis();
+    if (now - lastCloudPush >= (unsigned long)CLOUD_PUSH_MS) {
+        lastCloudPush = now;
+        String live = "{";
+        live += "\"moisturePct\":" + String(moisturePercentage);
+        live += ",\"moistureRaw\":" + String(sensorVal);
+        live += ",\"temperature\":" + String(temperatureC, 1);
+        live += ",\"humidity\":" + String(humidityPct, 1);
+        live += ",\"pumpOn\":" + String(pumpOn ? "true" : "false");
+        live += ",\"mode\":\"" + String(autoMode ? "auto" : "manual") + "\"";
+        live += ",\"updatedAt\":" + String(now / 1000);
+        live += "}";
+        if (firebasePut("/agriflow/live", live)) {
+            cloudOk = true;
+            lastCloudOk = now;
+        } else {
+            cloudOk = false;
+            Serial.println("Cloud: live push failed");
+        }
+    }
+    if (now - lastControlPoll >= (unsigned long)CONTROL_POLL_MS) {
+        lastControlPoll = now;
+        String payload;
+        if (firebaseGet("/agriflow/control", payload)) {
+            cloudOk = true;
+            lastCloudOk = now;
+            applyControl(payload);
+        } else {
+            cloudOk = false;
+            Serial.println("Cloud: control poll failed");
+        }
+    }
+    if (now - lastHistoryPush >= (unsigned long)HISTORY_PUSH_MS) {
+        lastHistoryPush = now;
+        String sample = "{";
+        sample += "\"moisturePct\":" + String(moisturePercentage);
+        sample += ",\"temperature\":" + String(temperatureC, 1);
+        sample += ",\"humidity\":" + String(humidityPct, 1);
+        sample += ",\"t\":" + String(now / 1000);
+        sample += "}";
+        if (!firebasePost("/agriflow/history", sample)) {
+            Serial.println("Cloud: history push failed");
+        }
+    }
+}
+
+// WiFi LED: solid ON while online; slow blink while AP-only.
+void wifiLedService() {
+    if (wifiOnline) {
+        digitalWrite(wifiLed, HIGH);
+        return;
+    }
+    unsigned long now = millis();
+    if (now - wifiLedBlinkAt >= 500) {
+        wifiLedBlinkAt = now;
+        wifiLedState = !wifiLedState;
+        digitalWrite(wifiLed, wifiLedState ? HIGH : LOW);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Physical buttons — internal functions only, never server.send() here.
+// ---------------------------------------------------------------------------
+void button1Handler(AceButton *button, uint8_t eventType, uint8_t buttonState) {
+    if (eventType == AceButton::kEventReleased) {
+        Serial.println("Button 1: pump toggle pressed");
+        if (!doTogglePump()) Serial.println("Ignored: AUTO mode controls the pump");
+    }
+}
+
+void button2Handler(AceButton *button, uint8_t eventType, uint8_t buttonState) {
+    if (eventType == AceButton::kEventReleased) {
+        Serial.println("Button 2: mode toggle pressed");
+        doToggleMode();
+    }
+}
+
+// ---------------------------------------------------------------------------
+void setup() {
+    Serial.begin(115200);
+
+    pinMode(SensorPin, INPUT);
+    pinMode(RelayPin, OUTPUT);
+    pinMode(BuzzerPin, OUTPUT);
+    pinMode(ModeLed, OUTPUT);
+    pinMode(wifiLed, OUTPUT);
+    pinMode(RelayButtonPin, INPUT_PULLUP);
+    pinMode(ModeSwitchPin, INPUT_PULLUP);
+    setPump(false);
+    digitalWrite(BuzzerPin, LOW);
+    digitalWrite(ModeLed, autoMode ? HIGH : LOW);
+
+    dht.begin();
+
+    // V3: Access Point is ALWAYS up (fallback, exactly like V2.6), and the
+    // board also tries to join the phone hotspot as a station.
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAP(ssid, password);
+    Serial.println("Access Point Started");
+    Serial.print("Local dashboard: http://");
+    Serial.println(WiFi.softAPIP());
+
+    Serial.print("Joining hotspot ");
+    Serial.print(HOTSPOT_SSID);
+    Serial.print(" ... ");
+    WiFi.begin(HOTSPOT_SSID, HOTSPOT_PASS);
+    unsigned long wifiStart = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 20000) {
+        delay(250);
+        Serial.print(".");
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+        wifiOnline = true;
+        digitalWrite(wifiLed, HIGH);
+        Serial.println(" connected");
+        Serial.print("Board IP on hotspot: ");
+        Serial.println(WiFi.localIP());
+    } else {
+        Serial.println(" not reachable - AP-only mode (local page still works)");
+    }
+
+    config1.setEventHandler(button1Handler);
+    config2.setEventHandler(button2Handler);
+    button1.init(RelayButtonPin);
+    button2.init(ModeSwitchPin);
+
+    if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+        Serial.println(F("SSD1306 allocation failed"));
+        for (;;);
+    }
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(WHITE);
+
+    server.on("/", handleRoot);
+    server.on("/data", handleData);
+    server.on("/pump", handlePump);
+    server.on("/mode", handleMode);
+    server.on("/water", handleWater);  // timed watering (V2.4)
+    server.on("/toggle", handleToggle);  // legacy (V1)
+    server.on("/refresh", handleRoot);  // legacy (V1)
+    server.begin();
+    Serial.println("HTTP server started");
+
+    getMoisture();
+    readDHT();
+    updateOLED();
+    beep(1000);  // startup beep — non-blocking, buzzerService() ends it
+}
+
+// Pump failsafe + timed-watering service (V2.4) — runs every loop pass.
+// 1) A timed watering ends itself. 2) No run may exceed PUMP_MAX_RUN_MS:
+// the pump is stopped and a cooldown starts, whatever mode asked for it.
+void pumpGuardService() {
+    if (!pumpOn) return;
+    unsigned long now = millis();
+    if (timedWaterUntil && now >= timedWaterUntil) { setPump(false); return; }
+    if (now - pumpStartedAt >= PUMP_MAX_RUN_MS) {
+        setPump(false);
+        pumpCooldownUntil = now + PUMP_COOLDOWN_MS;
+        showOledEvent("FAILSAFE", "STOPPED");
+        Serial.println("FAILSAFE: pump stopped after max run — 60 s rest");
+    }
+}
+
+void loop() {
+    server.handleClient();
+    buzzerService();
+    pumpGuardService();
+    wifiLedService();
+
+    // OLED event flash over? Bring the normal screen back right away.
+    if (oledEventActive && millis() >= oledEventUntil) {
+        oledEventActive = false;
+        updateOLED();
+    }
+
+    unsigned long currentMillis = millis();
+    if (currentMillis - previousMillis >= (unsigned long)interval) {
+        previousMillis = currentMillis;
+        getMoisture();
+        readDHT();
+        updateOLED();
+    }
+
+    alertService();      // manual-mode moisture alerts (non-blocking)
+    controlPumpAuto();   // AUTO mode pump logic
+    cloudSyncService();  // V3: Firebase push/poll (no-op when offline)
+    button1.check();
+    button2.check();
+}
