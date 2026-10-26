@@ -1,0 +1,165 @@
+/**********************************************************************************
+ *  AGRIFLOW — Smart Plant Watering System — ESP32 + Firebase — V3.0
+ *  (Built on the V2.6 sketch by Muse — same hardware, same wiring, same
+ *   calibration, same local behaviour. V3 adds the cloud: the board joins
+ *   a phone hotspot, pushes live readings to Firebase, and takes pump/mode
+ *   commands from the cloud dashboard.)
+ *
+ *  WHAT V3 ADDS (V2.6 behaviour is unchanged underneath):
+ *   1. WiFi STA mode: the board joins your phone hotspot (see the three
+ *      FILL-IN values at the top of this file). If the hotspot is not
+ *      reachable within ~20 s, the board falls back to its own Access
+ *      Point "ESP32_Plant_System" (password 12345678) exactly like V2.6,
+ *      so the local dashboard at http://192.168.4.1 keeps working.
+ *      The WiFi LED (GPIO2) is ON when the board is online (STA
+ *      connected); in AP-only mode it blinks slowly.
+ *   2. Firebase push: every 10 s the board PUTs live readings to
+ *      /agriflow/live in Firebase Realtime Database (HTTPS REST, no auth
+ *      — the database is created in test mode; see README.md).
+ *   3. Firebase control: every 3 s the board GETs /agriflow/control and
+ *      applies it — mode (auto/manual), pump on/off (MANUAL mode only),
+ *      and the AUTO thresholds (defaults 30/50, overridable from the
+ *      dashboard). A history sample is POSTed to /agriflow/history
+ *      every 60 s for the dashboard chart.
+ *   4. Nothing else changes: sensors, pump failsafe, OLED, buttons,
+ *      buzzer, local web routes (/data, /pump, /mode, /water, /toggle)
+ *      all work exactly as in V2.6, including when the board is offline.
+ *
+ *  FILL IN BEFORE UPLOADING (both are at the top of this file):
+ *    HOTSPOT_SSID / HOTSPOT_PASS — your phone hotspot name + password.
+ *   FIREBASE_HOST is already set (agriflow-iot-default-rtdb.firebaseio.com).
+ *   The same hotspot values are NOT needed anywhere else; the dashboard
+ *   reads its Firebase values from dashboard/config.js (already filled).
+ *
+ *  HOW TO USE:
+ *   1. Upload this sketch from the Arduino IDE (board: ESP32 Dev Module).
+ *      Libraries needed: Adafruit SSD1306, Adafruit Unified Sensor,
+ *      DHT sensor library by Adafruit, AceButton by bxparks, ArduinoJson
+ *      by Benoit Blanchon (NEW in V3 — used to parse /control).
+ *      (WiFi, WebServer, HTTPClient and WiFiClientSecure ship with the
+ *      ESP32 board package — no install needed.)
+ *   2. Turn on your phone hotspot. The board joins it and starts pushing
+ *      to Firebase. Open the cloud dashboard link (Vercel) on any device.
+ *   3. Hotspot off? The board runs its own AP again — join
+ *      "ESP32_Plant_System" (12345678) and open http://192.168.4.1.
+ *   4. Physical controls still work exactly as before: button on GPIO32
+ *      toggles the pump (Manual mode only), button on GPIO33 switches
+ *      Auto/Manual, Mode LED (GPIO15) is ON in Auto mode.
+ *
+ *  NOTE ON SECURITY: the database is used in test mode (open read/write)
+ *  so the ESP32 needs no login token. That is fine for a college demo,
+ *  but it means anyone with the database URL can read/write it — and the
+ *  test-mode rules EXPIRE on 2026-11-24, after which Firebase blocks all
+ *  access until the rules are updated. Do not put anything private in
+ *  Firebase, and tighten the rules (or add auth) before any real
+ *  deployment — see README.md.
+ **********************************************************************************/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <ArduinoJson.h>
+#include <Adafruit_SSD1306.h>
+#include <DHT.h>
+#include <AceButton.h>
+using namespace ace_button;
+
+#define SCREEN_WIDTH 128  // OLED display width, in pixels
+#define SCREEN_HEIGHT 32  // OLED display height, in pixels
+#define OLED_RESET -1     // Reset pin # (or -1 if sharing Arduino reset pin)
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ---- Pin map (IDENTICAL to V1/V2 — do not change) ----
+#define SensorPin 34       // capacitive soil moisture sensor (analog in)
+#define DHTPin 14          // DHT11 data
+#define RelayPin 25        // pump relay / TIP122 driver
+#define wifiLed 2          // WiFi status LED (ON = online, blink = AP-only)
+#define RelayButtonPin 32  // physical button: pump
+#define ModeSwitchPin 33   // physical button: Auto/Manual
+#define BuzzerPin 26       // buzzer
+#define ModeLed 15         // ON = Auto mode
+
+#define DHTTYPE DHT11
+DHT dht(DHTPin, DHTTYPE);
+
+ButtonConfig config1;
+AceButton button1(&config1);
+ButtonConfig config2;
+AceButton button2(&config2);
+
+// ================= FILL IN THESE TWO VALUES BEFORE UPLOADING =================
+const char *HOTSPOT_SSID = "YOUR_HOTSPOT_SSID";   // your phone hotspot name
+const char *HOTSPOT_PASS = "YOUR_HOTSPOT_PASSWORD"; // your phone hotspot password
+// Firebase host for project agriflow-iot (Spark plan). The database is in
+// TEST MODE and its open rules EXPIRE on 2026-11-24 — see README.md.
+const char *FIREBASE_HOST = "agriflow-iot-default-rtdb.firebaseio.com";
+// =============================================================================
+
+const char *ssid = "ESP32_Plant_System";  // AP name (fallback)
+const char *password = "12345678";        // AP password (fallback)
+
+WebServer server(80);
+
+// Soil sensor calibration (measured with the calibration sketch — as V1)
+int wetSoilVal = 1050;  // sensor value in wet soil
+int drySoilVal = 3050;  // sensor value in dry soil
+
+// AUTO pump thresholds in percent (V2.5 — ON below 30%, OFF above 50%).
+// These are the defaults; the cloud dashboard can override them via
+// /agriflow/control (onThreshold / offThreshold).
+int moistPerLow = 30;   // pump ON below this
+int moistPerHigh = 50;  // pump OFF above this
+
+// ---- THE state. One source of truth — everything reads/writes via these ----
+bool pumpOn = false;    // is the pump actually running?
+bool autoMode = true;   // true = AUTO, false = MANUAL
+
+int sensorVal = 0;          // last raw analog reading
+int moisturePercentage = 0; // last computed moisture %
+float temperatureC = 0;     // last GOOD temperature reading
+float humidityPct = 0;      // last GOOD humidity reading
+bool dhtOk = false;         // did the last DHT read succeed?
+
+unsigned long previousMillis = 0;
+const long interval = 2000;  // sensor + OLED refresh interval (ms)
+unsigned long lastAlertMillis = 0;
+const long buzzerInterval = 3000;  // manual-mode alert repeat interval (ms)
+
+// Non-blocking buzzer state
+bool buzzerOn = false;
+unsigned long buzzerOffAt = 0;
+
+// ---- Pump failsafe + stats (V2.4) ----
+const unsigned long PUMP_MAX_RUN_MS = 120000;   // hard stop: 2 min continuous max
+const unsigned long PUMP_COOLDOWN_MS = 60000;   // then 60 s forced rest
+unsigned long pumpStartedAt = 0;      // millis() when the pump last turned ON
+unsigned long pumpCooldownUntil = 0;  // failsafe rest runs until this millis()
+unsigned long timedWaterUntil = 0;    // timed watering ends at this millis() (0 = none)
+unsigned long pumpTotalMs = 0;        // total pump run time since boot
+unsigned long lastRunSec = 0;         // duration of the last finished run (s)
+int pumpRuns = 0;                     // pump starts since boot
+
+// Moisture-sensor fault: raw pinned at an ADC extreme (0 / 4095) = wire out/short
+bool sensorFault = false;
+int faultStreak = 0;
+
+// ---- V3: cloud state ----
+bool wifiOnline = false;              // STA connected to the hotspot?
+unsigned long lastCloudPush = 0;      // last /agriflow/live push
+const long CLOUD_PUSH_MS = 10000;     // push live readings every 10 s
+unsigned long lastControlPoll = 0;    // last /agriflow/control poll
+const long CONTROL_POLL_MS = 3000;    // poll control every 3 s
+unsigned long lastHistoryPush = 0;    // last /agriflow/history sample
+const long HISTORY_PUSH_MS = 60000;   // history sample every 60 s
+unsigned long lastCloudOk = 0;        // last successful Firebase round-trip
+bool cloudOk = false;                 // did the last Firebase call succeed?
+unsigned long wifiLedBlinkAt = 0;     // AP-only LED blink timer
+bool wifiLedState = false;
+
+// ---------------------------------------------------------------------------
+// Dashboard page (single inline HTML file — no external resources, so it
+// works on the ESP32's own Access Point where there is no internet).
+// Written by build.py from page_template.html — do not edit by hand here.
+// ---------------------------------------------------------------------------
+const char PAGE_HTML[] PROGMEM = R"AGRIFLOW(
